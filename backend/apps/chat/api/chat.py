@@ -276,11 +276,13 @@ async def question_answer(session: SessionDep, current_user: CurrentUser, reques
 @require_permissions(permission=SqlbotPermission(type='chat', keyExpression="request_question.chat_id"))
 async def question_answer_eval(session: SessionDep, current_user: CurrentUser, request_question: ChatEvalQuestion,
                                current_assistant: CurrentAssistant):
+    # Evaluation callers need a single structured JSON payload instead of SSE chunks.
     return await question_answer_inner(
         session,
         current_user,
         request_question,
         current_assistant,
+        in_chat=False,
         stream=False,
         finish_step=request_question.finish_step,
         embedding=True

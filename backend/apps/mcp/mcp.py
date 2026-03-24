@@ -149,6 +149,8 @@ async def mcp_question(session: SessionDep, chat: McpQuestion):
             raise HTTPException(status_code=400, detail="Invalid datasource ID")
 
     mcp_chat = ChatMcp(token=chat.token, chat_id=chat.chat_id, question=chat.question, datasource_id=ds_id)
+    # Forward evaluation toggles so external callers can run the same ablation matrix
+    # as the internal /chat/question/eval endpoint.
     mcp_chat.disable_terms = bool(chat.disable_terms)
     mcp_chat.disable_sql_examples = bool(chat.disable_sql_examples)
     mcp_chat.disable_custom_prompt = bool(chat.disable_custom_prompt)

@@ -273,6 +273,7 @@ class LLMService:
         self.articles_number = articles_number
 
     def apply_sql_prompt_context(self, _session: Session, oid: int = None, ds_id: int = None):
+        # These switches let us run weak-RAG ablations without changing the default chat flow.
         if self.chat_question.disable_terms:
             self.chat_question.terminologies = ""
         else:
@@ -292,6 +293,8 @@ class LLMService:
 
     def build_debug_payload(self, generated_sql_text: Optional[str] = None, final_sql: Optional[str] = None,
                             executed_sql: Optional[str] = None):
+        # Keep the evaluation payload self-contained so batch scripts can capture
+        # both the final SQL and the retrieval context that shaped it.
         datasource_info = None
         if self.ds:
             datasource_info = {
@@ -1255,6 +1258,7 @@ class LLMService:
             if not stream:
                 json_result['executed_sql'] = real_execute_sql
                 if self.chat_question.include_debug_payload:
+                    # Expose retrieval context only for explicit evaluation/debug requests.
                     json_result['debug'] = self.build_debug_payload(
                         generated_sql_text=full_sql_text,
                         final_sql=sql,
