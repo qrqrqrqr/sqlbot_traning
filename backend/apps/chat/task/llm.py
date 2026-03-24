@@ -31,7 +31,7 @@ from apps.chat.curd.chat import save_question, save_sql_answer, save_sql, \
     get_old_questions, save_analysis_predict_record, rename_chat, get_chart_config, \
     get_chat_chart_data, list_generate_sql_logs, list_generate_chart_logs, start_log, end_log, \
     get_last_execute_sql_error, format_json_data, format_chart_fields, get_chat_brief_generate, get_chat_predict_data, \
-    get_chat_chart_config, trigger_log_error
+    get_chat_chart_config, trigger_log_error, get_chat_log_history
 from apps.chat.models.chat_model import ChatQuestion, ChatRecord, Chat, RenameChat, ChatLog, OperationEnum, \
     ChatFinishStep, AxisObj
 from apps.data_training.curd.data_training import get_training_template
@@ -271,6 +271,59 @@ class LLMService:
 
     def set_articles_number(self, articles_number: int):
         self.articles_number = articles_number
+
+    def apply_sql_prompt_context(self, _session: Session, oid: int = None, ds_id: int = None):
+        if self.chat_question.disable_terms:
+            self.chat_question.terminologies = ""
+        else:
+            self.filter_terminology_template(_session, oid, ds_id)
+
+        if self.chat_question.disable_sql_examples:
+            self.chat_question.data_training = ""
+        else:
+            self.filter_training_template(_session, oid, ds_id)
+
+        if self.chat_question.disable_custom_prompt:
+            self.chat_question.custom_prompt = ""
+        else:
+            self.filter_custom_prompts(_session, CustomPromptTypeEnum.GENERATE_SQL, oid, ds_id)
+
+        self.init_messages(_session)
+
+    def build_debug_payload(self, generated_sql_text: Optional[str] = None, final_sql: Optional[str] = None,
+                            executed_sql: Optional[str] = None):
+        datasource_info = None
+        if self.ds:
+            datasource_info = {
+                'id': self.ds.id,
+                'name': getattr(self.ds, 'name', None),
+                'type': getattr(self.ds, 'type', None),
+                'type_name': getattr(self.ds, 'type_name', None),
+                'engine': self.chat_question.engine,
+            }
+
+        debug_payload = {
+            'question': self.chat_question.question,
+            'datasource': datasource_info,
+            'disable_flags': {
+                'disable_terms': self.chat_question.disable_terms,
+                'disable_sql_examples': self.chat_question.disable_sql_examples,
+                'disable_custom_prompt': self.chat_question.disable_custom_prompt,
+            },
+            'retrieval': {
+                'db_schema': self.chat_question.db_schema,
+                'terminologies': self.chat_question.terminologies,
+                'sql_examples': self.chat_question.data_training,
+                'custom_prompt': self.chat_question.custom_prompt,
+            }
+        }
+        if generated_sql_text is not None:
+            debug_payload['generated_sql_text'] = generated_sql_text
+        if final_sql is not None:
+            debug_payload['final_sql'] = final_sql
+        if executed_sql is not None:
+            debug_payload['executed_sql'] = executed_sql
+        return debug_payload
 
     def get_fields_from_chart(self, _session: Session):
         chart_info = get_chart_config(_session, self.record.id)
@@ -637,14 +690,7 @@ class LLMService:
         if self.ds:
             oid = self.ds.oid if isinstance(self.ds, CoreDatasource) else 1
             ds_id = self.ds.id if isinstance(self.ds, CoreDatasource) else None
-
-            self.filter_terminology_template(_session, oid, ds_id)
-
-            self.filter_training_template(_session, oid, ds_id)
-
-            self.filter_custom_prompts(_session, CustomPromptTypeEnum.GENERATE_SQL, oid, ds_id)
-
-            self.init_messages(_session)
+            self.apply_sql_prompt_context(_session, oid, ds_id)
 
         if _error:
             raise _error
@@ -1078,14 +1124,7 @@ class LLMService:
             if self.ds:
                 oid = self.ds.oid if isinstance(self.ds, CoreDatasource) else 1
                 ds_id = self.ds.id if isinstance(self.ds, CoreDatasource) else None
-
-                self.filter_terminology_template(_session, oid, ds_id)
-
-                self.filter_training_template(_session, oid, ds_id)
-
-                self.filter_custom_prompts(_session, CustomPromptTypeEnum.GENERATE_SQL, oid, ds_id)
-
-                self.init_messages(_session)
+                self.apply_sql_prompt_context(_session, oid, ds_id)
 
             # return id
             if in_chat:
@@ -1138,6 +1177,8 @@ class LLMService:
                 yield 'data:' + orjson.dumps({'type': 'info', 'msg': 'sql generated'}).decode() + '\n\n'
             # filter sql
             SQLBotLogUtil.info(full_sql_text)
+            if not stream:
+                json_result['sql_generation_output'] = full_sql_text
 
             chart_type = self.get_chart_type_from_sql_answer(full_sql_text)
 
@@ -1193,6 +1234,7 @@ class LLMService:
 
             if not stream:
                 json_result['sql'] = sql
+                json_result['chart_type'] = chart_type
 
             format_sql = sqlparse.format(sql, reindent=True)
             if in_chat:
@@ -1210,7 +1252,20 @@ class LLMService:
                                                                           subsql)
                 real_execute_sql = assistant_dynamic_sql
 
+            if not stream:
+                json_result['executed_sql'] = real_execute_sql
+                if self.chat_question.include_debug_payload:
+                    json_result['debug'] = self.build_debug_payload(
+                        generated_sql_text=full_sql_text,
+                        final_sql=sql,
+                        executed_sql=real_execute_sql
+                    )
+
             if finish_step.value <= ChatFinishStep.GENERATE_SQL.value:
+                if not stream and self.chat_question.include_log_history:
+                    json_result['log_history'] = get_chat_log_history(
+                        _session, self.record.id, self.current_user
+                    ).model_dump(mode='json')
                 if in_chat:
                     yield 'data:' + orjson.dumps({'type': 'finish'}).decode() + '\n\n'
                 if not stream:
@@ -1234,6 +1289,7 @@ class LLMService:
                 yield 'data:' + orjson.dumps({'content': 'execute-success', 'type': 'sql-data'}).decode() + '\n\n'
             if not stream:
                 json_result['data'] = get_chat_chart_data(_session, self.record.id)
+                json_result['row_count'] = len(result.get('data', []))
 
             if finish_step.value <= ChatFinishStep.QUERY_DATA.value:
                 if stream:
@@ -1257,6 +1313,10 @@ class LLMService:
                             markdown_table = df_safe.to_markdown(index=False)
                             yield markdown_table + '\n\n'
                 else:
+                    if self.chat_question.include_log_history:
+                        json_result['log_history'] = get_chat_log_history(
+                            _session, self.record.id, self.current_user
+                        ).model_dump(mode='json')
                     yield json_result
                 return
 
@@ -1288,6 +1348,10 @@ class LLMService:
 
             if not stream:
                 json_result['chart'] = chart
+                if self.chat_question.include_log_history:
+                    json_result['log_history'] = get_chat_log_history(
+                        _session, self.record.id, self.current_user
+                    ).model_dump(mode='json')
 
             if in_chat:
                 yield 'data:' + orjson.dumps(

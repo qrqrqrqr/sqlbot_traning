@@ -149,9 +149,16 @@ async def mcp_question(session: SessionDep, chat: McpQuestion):
             raise HTTPException(status_code=400, detail="Invalid datasource ID")
 
     mcp_chat = ChatMcp(token=chat.token, chat_id=chat.chat_id, question=chat.question, datasource_id=ds_id)
+    mcp_chat.disable_terms = bool(chat.disable_terms)
+    mcp_chat.disable_sql_examples = bool(chat.disable_sql_examples)
+    mcp_chat.disable_custom_prompt = bool(chat.disable_custom_prompt)
+    mcp_chat.include_debug_payload = bool(chat.include_debug_payload)
+    mcp_chat.include_log_history = bool(chat.include_log_history)
+
+    finish_step = chat.finish_step if chat.finish_step is not None else ChatFinishStep.GENERATE_CHART
 
     return await question_answer_inner(session=session, current_user=session_user, request_question=mcp_chat,
-                                       in_chat=False, stream=chat.stream)
+                                       in_chat=False, stream=chat.stream, finish_step=finish_step)
 
 
 # Cordys crm

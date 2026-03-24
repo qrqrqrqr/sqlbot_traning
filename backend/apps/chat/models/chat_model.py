@@ -228,6 +228,11 @@ class AiModelQuestion(BaseModel):
     custom_prompt: str = ""
     error_msg: str = ""
     regenerate_record_id: Optional[int] = None
+    disable_terms: bool = False
+    disable_sql_examples: bool = False
+    disable_custom_prompt: bool = False
+    include_debug_payload: bool = False
+    include_log_history: bool = False
 
     def sql_sys_question(self, db_type: Union[str, DB], enable_query_limit: bool = True):
         _sql_template = get_sql_example_template(db_type)
@@ -315,6 +320,10 @@ class ChatQuestion(AiModelQuestion):
     datasource_id: Optional[int] = None
 
 
+class ChatEvalQuestion(ChatQuestion):
+    finish_step: ChatFinishStep = ChatFinishStep.GENERATE_SQL
+
+
 class ChatMcp(ChatQuestion):
     token: str
 
@@ -338,6 +347,12 @@ class McpQuestion(BaseModel):
     datasource_id: Optional[int | str] = Body(description='数据源ID，仅当当前对话没有确定数据源时有效', default=None)
     oid: Optional[str] = Body(
         description='组织ID，仅当数据源ID为空时有效，如果不传则为最后一次登录SQLBot时所使用的组织ID', default=None)
+    finish_step: Optional[ChatFinishStep] = Body(default=None)
+    disable_terms: Optional[bool] = Body(default=False)
+    disable_sql_examples: Optional[bool] = Body(default=False)
+    disable_custom_prompt: Optional[bool] = Body(default=False)
+    include_debug_payload: Optional[bool] = Body(default=False)
+    include_log_history: Optional[bool] = Body(default=False)
 
 
 class AxisObj(BaseModel):
