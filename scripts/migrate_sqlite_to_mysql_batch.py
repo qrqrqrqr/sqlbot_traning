@@ -45,6 +45,11 @@ def parse_args():
         help="Optional admin password for CREATE/DROP DATABASE. Falls back to mysql-password.",
     )
     parser.add_argument("--mysql-charset", default="utf8mb4")
+    parser.add_argument(
+        "--mysql-grant-host",
+        default="%",
+        help="Host pattern used when granting privileges to mysql-user",
+    )
     parser.add_argument("--drop-existing", action="store_true", help="Drop target database before import")
     parser.add_argument(
         "--db-id-from",
@@ -109,6 +114,8 @@ def discover_sqlite_files(roots: list[str], mode: str) -> list[tuple[str, Path]]
         if not root.exists():
             continue
         for sqlite_file in sorted(list(root.rglob("*.sqlite")) + list(root.rglob("*.db"))):
+            if "__MACOSX" in sqlite_file.parts or sqlite_file.name.startswith("._"):
+                continue
             db_id = infer_db_id(sqlite_file, mode)
             discovered.setdefault(db_id, sqlite_file)
     return sorted(discovered.items(), key=lambda item: item[0])
@@ -126,7 +133,14 @@ def get_mysql_conn(host: str, port: int, user: str, password: str, database: str
     )
 
 
-def ensure_database(admin_conf: dict[str, Any], db_name: str, charset: str, drop_existing: bool):
+def ensure_database(
+    admin_conf: dict[str, Any],
+    db_name: str,
+    charset: str,
+    drop_existing: bool,
+    grant_user: str,
+    grant_host: str,
+):
     conn = get_mysql_conn(**admin_conf, database=None)
     try:
         with conn.cursor() as cur:
@@ -135,6 +149,10 @@ def ensure_database(admin_conf: dict[str, Any], db_name: str, charset: str, drop
             cur.execute(
                 f"CREATE DATABASE IF NOT EXISTS {mysql_quote(db_name)} CHARACTER SET {charset} COLLATE {charset}_unicode_ci"
             )
+            cur.execute(
+                f"GRANT ALL PRIVILEGES ON {mysql_quote(db_name)}.* TO '{grant_user}'@'{grant_host}'"
+            )
+            cur.execute("FLUSH PRIVILEGES")
         conn.commit()
     finally:
         conn.close()
@@ -247,7 +265,14 @@ def main():
     for index, (db_id, sqlite_file) in enumerate(discovered, start=1):
         print(f"[{index}/{len(discovered)}] migrating {db_id} from {sqlite_file}", flush=True)
         try:
-            ensure_database(admin_conf, db_id, args.mysql_charset, args.drop_existing)
+            ensure_database(
+                admin_conf,
+                db_id,
+                args.mysql_charset,
+                args.drop_existing,
+                args.mysql_user,
+                args.mysql_grant_host,
+            )
             table_summaries = migrate_one(sqlite_file, db_id, mysql_conf)
             result = {
                 "db_id": db_id,
