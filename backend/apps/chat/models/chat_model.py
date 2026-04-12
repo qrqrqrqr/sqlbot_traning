@@ -324,6 +324,32 @@ class ChatEvalQuestion(ChatQuestion):
     finish_step: ChatFinishStep = ChatFinishStep.GENERATE_SQL
 
 
+class DrpoRewardConfig(BaseModel):
+    exec_success_reward: float = 0.2
+    result_match_reward: float = 1.0
+    exact_sql_bonus: float = 0.05
+    result_mismatch_penalty: float = -0.2
+    exec_error_penalty: float = -1.0
+    empty_sql_penalty: float = -1.0
+
+
+class DrpoCandidate(BaseModel):
+    candidate_id: Optional[str] = None
+    sql: str = ""
+
+
+class ChatDrpoPrepare(ChatQuestion):
+    pass
+
+
+class ChatDrpoScore(ChatQuestion):
+    gold_sql: str
+    candidate_sqls: List[DrpoCandidate]
+    float_places: int = 4
+    max_preview_rows: int = 5
+    reward: Optional[DrpoRewardConfig] = None
+
+
 class ChatMcp(ChatQuestion):
     token: str
 
@@ -353,6 +379,27 @@ class McpQuestion(BaseModel):
     disable_custom_prompt: Optional[bool] = Body(default=False)
     include_debug_payload: Optional[bool] = Body(default=False)
     include_log_history: Optional[bool] = Body(default=False)
+
+
+class McpDrpoPrepare(BaseModel):
+    question: str = Body(description='user question')
+    chat_id: int = Body(description='chat id')
+    token: str = Body(description='token')
+    lang: Optional[str] = Body(default='zh-CN')
+    datasource_id: Optional[int | str] = Body(default=None)
+    oid: Optional[str] = Body(default=None)
+    disable_terms: Optional[bool] = Body(default=False)
+    disable_sql_examples: Optional[bool] = Body(default=False)
+    disable_custom_prompt: Optional[bool] = Body(default=False)
+    include_debug_payload: Optional[bool] = Body(default=True)
+
+
+class McpDrpoScore(McpDrpoPrepare):
+    gold_sql: str = Body(description='reference sql used for reward calculation')
+    candidate_sqls: List[DrpoCandidate] = Body(description='candidate sql list to score')
+    float_places: Optional[int] = Body(default=4)
+    max_preview_rows: Optional[int] = Body(default=5)
+    reward: Optional[DrpoRewardConfig] = Body(default=None)
 
 
 class AxisObj(BaseModel):

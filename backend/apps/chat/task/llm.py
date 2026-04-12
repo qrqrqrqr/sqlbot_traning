@@ -1,11 +1,14 @@
 import concurrent
 import json
 import os
+import re
 import traceback
 import urllib.parse
 import warnings
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, Future
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from typing import Any, List, Optional, Union, Dict, Iterator
 
 import orjson
@@ -62,6 +65,313 @@ dynamic_subsql_prefix = 'select * from sqlbot_dynamic_temp_table_'
 session_maker = scoped_session(sessionmaker(bind=engine, class_=Session))
 
 i18n = I18n()
+
+
+def clean_sql_text(sql: Optional[str]) -> str:
+    if not sql:
+        return ''
+    result = sql.strip()
+    if result.startswith("```"):
+        lines = result.splitlines()
+        if len(lines) >= 3:
+            result = "\n".join(lines[1:-1]).strip()
+        elif len(lines) == 2:
+            result = lines[1].strip()
+    for prefix in ("sql\n", "sql ", "mysql\n", "mysql "):
+        if result.lower().startswith(prefix):
+            result = result[len(prefix):].strip()
+    while result.endswith(";"):
+        result = result[:-1].strip()
+    return result
+
+
+def normalize_sql_text(sql: Optional[str]) -> str:
+    result = clean_sql_text(sql).lower()
+    result = result.replace("`", "")
+    result = " ".join(result.split())
+    return result
+
+
+def normalize_exec_value(value: Any, float_places: int) -> Any:
+    if isinstance(value, Decimal):
+        return round(float(value), float_places)
+    if isinstance(value, float):
+        return round(value, float_places)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return repr(value)
+    return value
+
+
+def is_order_sensitive_sql(sql: str) -> bool:
+    lower_sql = f" {clean_sql_text(sql).lower()} "
+    return " order by " in lower_sql or " limit " in lower_sql
+
+
+def canonicalize_exec_result(result: dict[str, Any], ordered: bool, float_places: int) -> list[tuple[Any, ...]]:
+    fields = result.get("fields") or []
+    rows = result.get("data") or []
+    normalized_rows = []
+    for row in rows:
+        normalized_rows.append(
+            tuple(normalize_exec_value(row.get(field), float_places) for field in fields)
+        )
+    if not ordered:
+        normalized_rows = sorted(
+            normalized_rows,
+            key=lambda item: json.dumps(item, ensure_ascii=False, default=str)
+        )
+    return normalized_rows
+
+
+def preview_exec_rows(result: dict[str, Any], max_rows: int) -> list[dict[str, Any]]:
+    rows = result.get("data") or []
+    if max_rows <= 0:
+        return []
+    return rows[:max_rows]
+
+
+SQLITE_DIALECT_PATTERNS = [
+    re.compile(r"\bstrftime\s*\(", re.IGNORECASE),
+    re.compile(r"\bjulianday\s*\(", re.IGNORECASE),
+    re.compile(r"%J", re.IGNORECASE),
+]
+
+SQL_KEYWORDS = {
+    "select", "from", "where", "join", "inner", "left", "right", "full", "outer", "on", "and", "or",
+    "group", "by", "order", "limit", "having", "as", "case", "when", "then", "else", "end", "distinct",
+    "between", "like", "in", "is", "null", "not", "count", "sum", "avg", "min", "max", "asc", "desc",
+}
+
+
+def clip_reward(value: float, min_value: float = -1.0, max_value: float = 1.5) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def looks_like_sql(sql: str) -> bool:
+    lowered = clean_sql_text(sql).lower()
+    return lowered.startswith("select ") or lowered.startswith("with ")
+
+
+def is_plain_sql_response(raw_sql: str) -> bool:
+    lowered = (raw_sql or "").strip().lower()
+    if not lowered:
+        return False
+    if lowered.startswith("```"):
+        return False
+    for prefix in ("here is", "the sql", "sql query", "answer:"):
+        if lowered.startswith(prefix):
+            return False
+    return True
+
+
+def strip_string_literals(sql: str) -> str:
+    sql = re.sub(r"'(?:''|[^'])*'", "''", sql)
+    sql = re.sub(r'"(?:""|[^"])*"', '""', sql)
+    return sql
+
+
+def normalize_identifier(token: str) -> str:
+    result = (token or "").replace("`", "").replace('"', "").strip().lower()
+    if "." in result:
+        result = result.split(".")[-1]
+    return result
+
+
+def extract_table_names(sql: str) -> set[str]:
+    sanitized = strip_string_literals(clean_sql_text(sql))
+    matches = re.findall(
+        r"\b(?:from|join)\s+([`\"]?[A-Za-z_][\w$-]*[`\"]?(?:\.[`\"]?[A-Za-z_][\w$-]*[`\"]?)?)",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    return {normalize_identifier(item) for item in matches if item}
+
+
+def extract_column_names(sql: str) -> set[str]:
+    sanitized = strip_string_literals(clean_sql_text(sql))
+    tables = extract_table_names(sql)
+    columns: set[str] = set()
+
+    qualified = re.findall(
+        r"([`\"]?[A-Za-z_][\w$-]*[`\"]?\.[`\"]?[A-Za-z_][\w$-]*[`\"]?)",
+        sanitized,
+        flags=re.IGNORECASE,
+    )
+    for item in qualified:
+        normalized = normalize_identifier(item)
+        if normalized and normalized not in SQL_KEYWORDS:
+            columns.add(normalized)
+
+    bare_tokens = re.findall(r"\b([A-Za-z_][\w$-]*)\b", sanitized)
+    for token in bare_tokens:
+        lowered = token.lower()
+        if lowered in SQL_KEYWORDS or lowered in tables:
+            continue
+        if re.fullmatch(r"t\d+", lowered):
+            continue
+        columns.add(lowered)
+    return columns
+
+
+def jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left | right), 1)
+
+
+def extract_aggregate_signature(sql: str) -> str:
+    lowered = clean_sql_text(sql).lower()
+    if re.search(r"\bcount\s*\(\s*distinct\b", lowered):
+        return "count_distinct"
+    for func_name in ("count", "avg", "sum", "min", "max"):
+        if re.search(rf"\b{func_name}\s*\(", lowered):
+            return func_name
+    return ""
+
+
+def extract_where_clause(sql: str) -> str:
+    sanitized = clean_sql_text(sql)
+    match = re.search(
+        r"\bwhere\b(.+?)(?:\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)",
+        sanitized,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def normalize_literal(value: str) -> str:
+    result = (value or "").strip()
+    if result.startswith(("'", '"')) and result.endswith(("'", '"')) and len(result) >= 2:
+        result = result[1:-1]
+    return result.strip().lower()
+
+
+def extract_filter_slots(sql: str) -> list[dict[str, str]]:
+    clause = extract_where_clause(sql)
+    if not clause:
+        return []
+
+    slots: list[dict[str, str]] = []
+    remainder = clause
+
+    between_pattern = re.compile(
+        r"([`\"]?[A-Za-z_][\w$-]*[`\"]?(?:\.[`\"]?[A-Za-z_][\w$-]*[`\"]?)?)\s+between\s+"
+        r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[\w:\-./%]+)\s+and\s+"
+        r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[\w:\-./%]+)",
+        flags=re.IGNORECASE,
+    )
+    for match in between_pattern.finditer(clause):
+        slots.append(
+            {
+                "field": normalize_identifier(match.group(1)),
+                "operator": "between",
+                "value": f"{normalize_literal(match.group(2))}..{normalize_literal(match.group(3))}",
+            }
+        )
+    remainder = between_pattern.sub(" ", remainder)
+
+    binary_pattern = re.compile(
+        r"([`\"]?[A-Za-z_][\w$-]*[`\"]?(?:\.[`\"]?[A-Za-z_][\w$-]*[`\"]?)?)\s*"
+        r"(=|!=|<>|>=|<=|>|<|like)\s*"
+        r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|[\w:\-./%]+)",
+        flags=re.IGNORECASE,
+    )
+    for match in binary_pattern.finditer(remainder):
+        slots.append(
+            {
+                "field": normalize_identifier(match.group(1)),
+                "operator": match.group(2).lower(),
+                "value": normalize_literal(match.group(3)),
+            }
+        )
+    return slots
+
+
+def compute_filter_slot_match_ratio(gold_slots: list[dict[str, str]], pred_slots: list[dict[str, str]]) -> float:
+    if not gold_slots:
+        return 0.0
+    if not pred_slots:
+        return 0.0
+
+    score = 0.0
+    for gold in gold_slots:
+        best = 0.0
+        for pred in pred_slots:
+            if pred["field"] == gold["field"] and pred["value"] == gold["value"]:
+                best = max(best, 1.0)
+            elif pred["field"] == gold["field"]:
+                best = max(best, 0.25)
+            elif pred["value"] == gold["value"]:
+                best = max(best, 0.4)
+        score += best
+    return score / max(len(gold_slots), 1)
+
+
+def count_hallucinated_filters(gold_slots: list[dict[str, str]], pred_slots: list[dict[str, str]]) -> int:
+    if not pred_slots:
+        return 0
+    gold_fields = {item["field"] for item in gold_slots}
+    gold_values = {item["value"] for item in gold_slots}
+    count = 0
+    for pred in pred_slots:
+        if pred["field"] not in gold_fields and pred["value"] not in gold_values:
+            count += 1
+    return count
+
+
+def count_sqlite_dialect_markers(sql: str) -> int:
+    lowered = clean_sql_text(sql)
+    return sum(1 for pattern in SQLITE_DIALECT_PATTERNS if pattern.search(lowered))
+
+
+def multiset_f1_score(gold_rows: list[tuple[Any, ...]], pred_rows: list[tuple[Any, ...]]) -> float:
+    if not gold_rows and not pred_rows:
+        return 1.0
+    if not gold_rows or not pred_rows:
+        return 0.0
+
+    gold_counter = Counter(gold_rows)
+    pred_counter = Counter(pred_rows)
+    overlap = sum(min(gold_counter[item], pred_counter[item]) for item in gold_counter.keys() | pred_counter.keys())
+    precision = overlap / max(len(pred_rows), 1)
+    recall = overlap / max(len(gold_rows), 1)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def compute_result_similarity(
+    gold_rows: list[tuple[Any, ...]],
+    pred_rows: list[tuple[Any, ...]],
+) -> float:
+    if gold_rows == pred_rows:
+        return 1.0
+
+    if (
+        len(gold_rows) == 1
+        and len(pred_rows) == 1
+        and len(gold_rows[0]) == 1
+        and len(pred_rows[0]) == 1
+    ):
+        gold_value = gold_rows[0][0]
+        pred_value = pred_rows[0][0]
+        if isinstance(gold_value, (int, float)) and isinstance(pred_value, (int, float)):
+            relative_error = abs(pred_value - gold_value) / max(abs(gold_value), 1)
+            if relative_error <= 0.01:
+                return 0.8
+            if relative_error <= 0.05:
+                return 0.5
+            if relative_error <= 0.20:
+                return 0.2
+
+    return multiset_f1_score(gold_rows, pred_rows)
 
 
 class LLMService:
@@ -327,6 +637,305 @@ class LLMService:
         if executed_sql is not None:
             debug_payload['executed_sql'] = executed_sql
         return debug_payload
+
+    def resolve_prompt_scope(self, oid: int = None, ds_id: int = None) -> tuple[int | None, int | None]:
+        calculate_oid = oid
+        calculate_ds_id = ds_id
+        if self.current_assistant:
+            calculate_oid = self.current_assistant.oid if self.current_assistant.type != 4 else self.current_user.oid
+            if self.current_assistant.type == 1:
+                calculate_ds_id = None
+        return calculate_oid, calculate_ds_id
+
+    def prepare_sql_prompt_pack(self, _session: Session, oid: int = None, ds_id: int = None) -> dict[str, Any]:
+        if not self.ds:
+            raise SingleMessageError("No available datasource configuration found")
+
+        calculate_oid, calculate_ds_id = self.resolve_prompt_scope(oid, ds_id)
+
+        self.chat_question.db_schema = self.out_ds_instance.get_db_schema(
+            self.ds.id, self.chat_question.question
+        ) if self.out_ds_instance else get_table_schema(
+            session=_session,
+            current_user=self.current_user,
+            ds=self.ds,
+            question=self.chat_question.question
+        )
+
+        if self.chat_question.disable_terms:
+            self.chat_question.terminologies = ""
+        else:
+            self.chat_question.terminologies, _ = get_terminology_template(
+                _session, self.chat_question.question, calculate_oid, calculate_ds_id
+            )
+
+        if self.chat_question.disable_sql_examples:
+            self.chat_question.data_training = ""
+        else:
+            if self.current_assistant and self.current_assistant.type == 1:
+                self.chat_question.data_training, _ = get_training_template(
+                    _session,
+                    self.chat_question.question,
+                    calculate_oid,
+                    None,
+                    self.current_assistant.id
+                )
+            else:
+                self.chat_question.data_training, _ = get_training_template(
+                    _session,
+                    self.chat_question.question,
+                    calculate_oid,
+                    calculate_ds_id
+                )
+
+        if self.chat_question.disable_custom_prompt:
+            self.chat_question.custom_prompt = ""
+        elif SQLBotLicenseUtil.valid():
+            self.chat_question.custom_prompt, _ = find_custom_prompts(
+                _session,
+                CustomPromptTypeEnum.GENERATE_SQL,
+                calculate_oid,
+                calculate_ds_id
+            )
+        else:
+            self.chat_question.custom_prompt = ""
+
+        system_prompt = self.chat_question.sql_sys_question(self.ds.type, self.enable_sql_row_limit)
+        user_prompt = self.chat_question.sql_user_question(
+            current_time=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            change_title=False
+        )
+
+        return {
+            'engine': self.chat_question.engine,
+            'db_schema': self.chat_question.db_schema,
+            'terminologies': self.chat_question.terminologies,
+            'sql_examples': self.chat_question.data_training,
+            'custom_prompt': self.chat_question.custom_prompt,
+            'system_prompt': system_prompt,
+            'user_prompt': user_prompt,
+            'messages': [
+                {'role': 'system', 'content': system_prompt},
+                {'role': 'user', 'content': user_prompt},
+            ],
+            'debug': self.build_debug_payload(),
+        }
+
+    def score_sql_candidates(
+        self,
+        _session: Session,
+        gold_sql: str,
+        candidate_sqls: list[Any],
+        float_places: int = 4,
+        max_preview_rows: int = 5,
+        reward_config: Optional[dict[str, float]] = None
+    ) -> dict[str, Any]:
+        if not self.ds:
+            raise SingleMessageError("No available datasource configuration found")
+
+        connected = check_connection(ds=self.ds, trans=None)
+        if not connected:
+            raise SQLBotDBConnectionError('Connect DB failed')
+
+        reward_defaults = {
+            'non_empty_reward': 0.02,
+            'looks_like_sql_reward': 0.03,
+            'plain_sql_reward': 0.05,
+            'exec_success_reward': 0.15,
+            'table_overlap_weight': 0.05,
+            'column_overlap_weight': 0.10,
+            'aggregation_match_reward': 0.05,
+            'filter_slot_weight': 0.20,
+            'result_match_reward': 0.80,
+            'exact_sql_bonus': 0.05,
+            'result_mismatch_penalty': 0.0,
+            'dialect_penalty': 0.20,
+            'dialect_penalty_cap': 0.40,
+            'hallucinated_filter_penalty': 0.10,
+            'hallucinated_filter_penalty_cap': 0.20,
+            'exec_error_penalty': -0.70,
+            'empty_sql_penalty': -1.0,
+        }
+        if reward_config:
+            reward_defaults.update(reward_config)
+
+        cleaned_gold_sql = clean_sql_text(gold_sql)
+        gold_tables = extract_table_names(cleaned_gold_sql)
+        gold_columns = extract_column_names(cleaned_gold_sql)
+        gold_aggregate = extract_aggregate_signature(cleaned_gold_sql)
+        gold_slots = extract_filter_slots(cleaned_gold_sql)
+        gold_result = None
+        gold_norm: list[tuple[Any, ...]] = []
+        gold_preview = []
+        gold_row_count = 0
+        if cleaned_gold_sql:
+            try:
+                gold_result = exec_sql(ds=self.ds, sql=cleaned_gold_sql, origin_column=False)
+                gold_preview = preview_exec_rows(gold_result, max_preview_rows)
+                gold_row_count = len(gold_result.get('data') or [])
+            except Exception as exc:
+                raise SingleMessageError(f"Gold SQL execution failed: {exc}")
+
+        candidate_reports: list[dict[str, Any]] = []
+        for index, candidate in enumerate(candidate_sqls):
+            candidate_id = getattr(candidate, 'candidate_id', None)
+            raw_sql = getattr(candidate, 'sql', '') if hasattr(candidate, 'sql') else candidate.get('sql', '')
+            cleaned_sql = clean_sql_text(raw_sql)
+            pred_tables = extract_table_names(cleaned_sql)
+            pred_columns = extract_column_names(cleaned_sql)
+            pred_aggregate = extract_aggregate_signature(cleaned_sql)
+            pred_slots = extract_filter_slots(cleaned_sql)
+
+            report = {
+                'index': index,
+                'candidate_id': candidate_id if candidate_id is not None else str(index),
+                'raw_sql': raw_sql,
+                'clean_sql': cleaned_sql,
+                'exec_ok': False,
+                'result_match': False,
+                'exact_sql_match': False,
+                'reward': reward_defaults['empty_sql_penalty'],
+                'reward_components': {},
+                'error': '',
+                'row_count': 0,
+                'result_preview': [],
+                'result_similarity': 0.0,
+                'table_overlap': 0.0,
+                'column_overlap': 0.0,
+                'filter_slot_match': 0.0,
+                'dialect_marker_count': 0,
+                'hallucinated_filter_count': 0,
+            }
+
+            if not cleaned_sql:
+                report['reward_components']['empty_sql_penalty'] = reward_defaults['empty_sql_penalty']
+                candidate_reports.append(report)
+                continue
+
+            reward = 0.0
+            reward += reward_defaults['non_empty_reward']
+            report['reward_components']['non_empty_reward'] = reward_defaults['non_empty_reward']
+
+            if looks_like_sql(cleaned_sql):
+                reward += reward_defaults['looks_like_sql_reward']
+                report['reward_components']['looks_like_sql_reward'] = reward_defaults['looks_like_sql_reward']
+
+            if is_plain_sql_response(raw_sql):
+                reward += reward_defaults['plain_sql_reward']
+                report['reward_components']['plain_sql_reward'] = reward_defaults['plain_sql_reward']
+
+            table_overlap = jaccard_similarity(gold_tables, pred_tables)
+            report['table_overlap'] = table_overlap
+            table_reward = reward_defaults['table_overlap_weight'] * table_overlap
+            reward += table_reward
+            report['reward_components']['table_overlap_reward'] = round(table_reward, 6)
+
+            column_overlap = jaccard_similarity(gold_columns, pred_columns)
+            report['column_overlap'] = column_overlap
+            column_reward = reward_defaults['column_overlap_weight'] * column_overlap
+            reward += column_reward
+            report['reward_components']['column_overlap_reward'] = round(column_reward, 6)
+
+            if gold_aggregate and pred_aggregate == gold_aggregate:
+                reward += reward_defaults['aggregation_match_reward']
+                report['reward_components']['aggregation_match_reward'] = reward_defaults['aggregation_match_reward']
+
+            filter_slot_match = compute_filter_slot_match_ratio(gold_slots, pred_slots)
+            report['filter_slot_match'] = filter_slot_match
+            filter_slot_reward = reward_defaults['filter_slot_weight'] * filter_slot_match
+            reward += filter_slot_reward
+            report['reward_components']['filter_slot_reward'] = round(filter_slot_reward, 6)
+
+            hallucinated_filter_count = count_hallucinated_filters(gold_slots, pred_slots)
+            report['hallucinated_filter_count'] = hallucinated_filter_count
+            if hallucinated_filter_count > 0:
+                hallucination_penalty = min(
+                    hallucinated_filter_count * reward_defaults['hallucinated_filter_penalty'],
+                    reward_defaults['hallucinated_filter_penalty_cap'],
+                )
+                reward -= hallucination_penalty
+                report['reward_components']['hallucinated_filter_penalty'] = -round(hallucination_penalty, 6)
+
+            dialect_marker_count = count_sqlite_dialect_markers(cleaned_sql)
+            report['dialect_marker_count'] = dialect_marker_count
+            if dialect_marker_count > 0:
+                dialect_penalty = min(
+                    dialect_marker_count * reward_defaults['dialect_penalty'],
+                    reward_defaults['dialect_penalty_cap'],
+                )
+                reward -= dialect_penalty
+                report['reward_components']['dialect_penalty'] = -round(dialect_penalty, 6)
+
+            try:
+                pred_result = exec_sql(ds=self.ds, sql=cleaned_sql, origin_column=False)
+                report['exec_ok'] = True
+                report['row_count'] = len(pred_result.get('data') or [])
+                report['result_preview'] = preview_exec_rows(pred_result, max_preview_rows)
+                reward += reward_defaults['exec_success_reward']
+                report['reward_components']['exec_success_reward'] = reward_defaults['exec_success_reward']
+
+                if gold_result is not None:
+                    ordered = is_order_sensitive_sql(cleaned_gold_sql) or is_order_sensitive_sql(cleaned_sql)
+                    gold_norm = canonicalize_exec_result(gold_result, ordered, float_places)
+                    pred_norm = canonicalize_exec_result(pred_result, ordered, float_places)
+                    result_similarity = compute_result_similarity(gold_norm, pred_norm)
+                    report['result_similarity'] = result_similarity
+                    result_reward = reward_defaults['result_match_reward'] * result_similarity
+                    reward += result_reward
+                    report['reward_components']['result_similarity_reward'] = round(result_reward, 6)
+
+                    if gold_norm == pred_norm:
+                        report['result_match'] = True
+
+                if cleaned_gold_sql and normalize_sql_text(cleaned_sql) == normalize_sql_text(cleaned_gold_sql):
+                    report['exact_sql_match'] = True
+                    reward += reward_defaults['exact_sql_bonus']
+                    report['reward_components']['exact_sql_bonus'] = reward_defaults['exact_sql_bonus']
+
+                report['reward'] = clip_reward(reward)
+            except Exception as exc:
+                report['error'] = str(exc)
+                reward += reward_defaults['exec_error_penalty']
+                report['reward_components']['exec_error_penalty'] = reward_defaults['exec_error_penalty']
+                report['reward'] = clip_reward(reward)
+
+            candidate_reports.append(report)
+
+        sorted_reports = sorted(
+            candidate_reports,
+            key=lambda item: (
+                item['reward'],
+                1 if item['result_match'] else 0,
+                1 if item['exec_ok'] else 0,
+                1 if item['exact_sql_match'] else 0,
+                -item['index'],
+            ),
+            reverse=True
+        )
+
+        chosen = sorted_reports[0] if sorted_reports else None
+        rejected = sorted_reports[-1] if len(sorted_reports) > 1 else None
+        pair_ready = bool(chosen and rejected and chosen['reward'] > rejected['reward'])
+
+        return {
+            'datasource': {
+                'id': self.ds.id,
+                'name': getattr(self.ds, 'name', None),
+                'type': getattr(self.ds, 'type', None),
+                'type_name': getattr(self.ds, 'type_name', None),
+                'engine': self.chat_question.engine,
+            },
+            'gold': {
+                'sql': cleaned_gold_sql,
+                'row_count': gold_row_count,
+                'result_preview': gold_preview,
+            },
+            'reward_config': reward_defaults,
+            'candidates': candidate_reports,
+            'chosen': chosen,
+            'rejected': rejected,
+            'pair_ready': pair_ready,
+        }
 
     def get_fields_from_chart(self, _session: Session):
         chart_info = get_chart_config(_session, self.record.id)

@@ -13,7 +13,8 @@ from sqlmodel import select
 
 from apps.chat.api.chat import create_chat, question_answer_inner
 from apps.chat.models.chat_model import ChatMcp, CreateChat, ChatStart, McpQuestion, McpAssistant, ChatQuestion, \
-    ChatFinishStep, McpDs
+    ChatFinishStep, McpDs, McpDrpoPrepare, McpDrpoScore
+from apps.chat.task.llm import LLMService
 from apps.datasource.crud.datasource import get_datasource_list
 from apps.system.crud.user import authenticate, user_ws_options
 from apps.system.crud.user import get_db_user
@@ -32,6 +33,21 @@ reusable_oauth2 = XOAuth2PasswordBearer(
 )
 
 router = APIRouter(tags=["mcp"], prefix="/mcp")
+
+
+def parse_datasource_id(datasource_id: Optional[int | str]) -> Optional[int]:
+    if datasource_id is None:
+        return None
+    if isinstance(datasource_id, str):
+        if datasource_id.strip() == "":
+            return None
+        try:
+            return int(datasource_id.strip())
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="Invalid datasource ID") from exc
+    if isinstance(datasource_id, int):
+        return datasource_id
+    raise HTTPException(status_code=400, detail="Invalid datasource ID")
 
 
 # @router.post("/access_token", operation_id="access_token")
@@ -133,20 +149,7 @@ async def mcp_question(session: SessionDep, chat: McpQuestion):
     session_user = get_user(session, chat.token)
     if chat.oid:
         session_user.oid = int(chat.oid)
-    ds_id: Optional[int] = None
-    if chat.datasource_id:
-        if isinstance(chat.datasource_id, str):
-            if chat.datasource_id.strip() == "":
-                ds_id = None
-            else:
-                try:
-                    ds_id = int(chat.datasource_id.strip())
-                except ValueError:
-                    raise HTTPException(status_code=400, detail="Invalid datasource ID")
-        elif isinstance(chat.datasource_id, int):
-            ds_id = chat.datasource_id
-        else:
-            raise HTTPException(status_code=400, detail="Invalid datasource ID")
+    ds_id = parse_datasource_id(chat.datasource_id)
 
     mcp_chat = ChatMcp(token=chat.token, chat_id=chat.chat_id, question=chat.question, datasource_id=ds_id)
     # Forward evaluation toggles so external callers can run the same ablation matrix
@@ -161,6 +164,75 @@ async def mcp_question(session: SessionDep, chat: McpQuestion):
 
     return await question_answer_inner(session=session, current_user=session_user, request_question=mcp_chat,
                                        in_chat=False, stream=chat.stream, finish_step=finish_step)
+
+
+@router.post("/mcp_drpo_prepare", operation_id="mcp_drpo_prepare")
+async def mcp_drpo_prepare(session: SessionDep, chat: McpDrpoPrepare):
+    session_user = get_user(session, chat.token)
+    if chat.oid:
+        session_user.oid = int(chat.oid)
+
+    ds_id = parse_datasource_id(chat.datasource_id)
+    request_question = ChatQuestion(chat_id=chat.chat_id, question=chat.question, datasource_id=ds_id)
+    request_question.disable_terms = bool(chat.disable_terms)
+    request_question.disable_sql_examples = bool(chat.disable_sql_examples)
+    request_question.disable_custom_prompt = bool(chat.disable_custom_prompt)
+    request_question.include_debug_payload = bool(chat.include_debug_payload)
+
+    llm_service = await LLMService.create(session, session_user, request_question, None, embedding=True)
+    if not llm_service.ds:
+        raise HTTPException(status_code=400, detail="No datasource selected for DRPO prepare")
+
+    oid = llm_service.ds.oid if hasattr(llm_service.ds, 'oid') else 1
+    ds_context_id = llm_service.ds.id if hasattr(llm_service.ds, 'id') else None
+    prompt_pack = llm_service.prepare_sql_prompt_pack(session, oid, ds_context_id)
+
+    return {
+        "success": True,
+        "mode": "online_drpo_prepare",
+        "chat_id": chat.chat_id,
+        "datasource_id": ds_context_id,
+        "prompt_pack": prompt_pack,
+    }
+
+
+@router.post("/mcp_drpo_score", operation_id="mcp_drpo_score")
+async def mcp_drpo_score(session: SessionDep, chat: McpDrpoScore):
+    session_user = get_user(session, chat.token)
+    if chat.oid:
+        session_user.oid = int(chat.oid)
+
+    ds_id = parse_datasource_id(chat.datasource_id)
+    request_question = ChatQuestion(chat_id=chat.chat_id, question=chat.question, datasource_id=ds_id)
+    request_question.disable_terms = bool(chat.disable_terms)
+    request_question.disable_sql_examples = bool(chat.disable_sql_examples)
+    request_question.disable_custom_prompt = bool(chat.disable_custom_prompt)
+    request_question.include_debug_payload = bool(chat.include_debug_payload)
+
+    llm_service = await LLMService.create(session, session_user, request_question, None, embedding=True)
+    if not llm_service.ds:
+        raise HTTPException(status_code=400, detail="No datasource selected for DRPO scoring")
+
+    oid = llm_service.ds.oid if hasattr(llm_service.ds, 'oid') else 1
+    ds_context_id = llm_service.ds.id if hasattr(llm_service.ds, 'id') else None
+    prompt_pack = llm_service.prepare_sql_prompt_pack(session, oid, ds_context_id)
+    score_result = llm_service.score_sql_candidates(
+        session,
+        gold_sql=chat.gold_sql,
+        candidate_sqls=chat.candidate_sqls,
+        float_places=int(chat.float_places or 4),
+        max_preview_rows=int(chat.max_preview_rows or 5),
+        reward_config=chat.reward.model_dump() if chat.reward else None,
+    )
+
+    return {
+        "success": True,
+        "mode": "online_drpo_score",
+        "chat_id": chat.chat_id,
+        "datasource_id": ds_context_id,
+        "prompt_pack": prompt_pack if chat.include_debug_payload else None,
+        "score_result": score_result,
+    }
 
 
 # Cordys crm
